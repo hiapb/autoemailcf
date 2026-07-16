@@ -651,8 +651,7 @@ interactive_config() {
         changed=1
     fi
 
-    IFS= read -r -s -p "2. 输入 CF JWT Token（输入内容隐藏；链接中 jwt= 后面的内容）: " input_token
-    echo
+    IFS= read -r -p "2. 输入 CF JWT Token（链接中 jwt= 后面的内容）: " input_token
     if [[ -n "$input_token" ]]; then
         write_config_value "cf_api_token" "$input_token" || { mv -f "$backup" "$CONFIG_FILE"; return 1; }
         changed=1
@@ -690,8 +689,7 @@ interactive_config() {
         changed=1
     fi
 
-    IFS= read -r -s -p "8. 输入 SMTP 密码（输入内容隐藏）: " input_pass
-    echo
+    IFS= read -r -p "8. 输入 SMTP 密码: " input_pass
     if [[ -n "$input_pass" ]]; then
         write_config_value "smtp_pass" "$input_pass" || { mv -f "$backup" "$CONFIG_FILE"; return 1; }
         changed=1
@@ -900,7 +898,7 @@ show_menu() {
         fi
         echo -e "================================================="
         echo -e "  ${YELLOW}1.${PLAIN} 一键安装、配置并启动"
-        echo -e "  ${YELLOW}2.${PLAIN} 修改配置并自动重启"
+        echo -e "  ${YELLOW}2.${PLAIN} 修改配置"
         echo -e "  ${YELLOW}3.${PLAIN} 重启服务"
         echo -e "  ${YELLOW}4.${PLAIN} 停止服务"
         echo -e "  ${YELLOW}5.${PLAIN} 启动服务"
