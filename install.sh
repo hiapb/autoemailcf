@@ -72,6 +72,8 @@ config_path = Path(sys.argv[2])
 name_map = {
     "CF_API_URL": "cf_api_url",
     "CF_API_TOKEN": "cf_api_token",
+    "SMTP_SERVER": "smtp_host",
+    "SMTP_PORT": "smtp_port",
     "SMTP_USER": "smtp_user",
     "SMTP_PASS": "smtp_pass",
     "REPLY_BODY": "reply_body",
@@ -101,9 +103,9 @@ for node in tree.body:
     target = node.targets[0]
     if not isinstance(target, ast.Name) or target.id not in name_map:
         continue
-    if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+    if isinstance(node.value, ast.Constant) and isinstance(node.value.value, (str, int)):
         value = node.value.value
-        config[name_map[target.id]] = "" if value in placeholders else value
+        config[name_map[target.id]] = "" if isinstance(value, str) and value in placeholders else value
 
 config_path.parent.mkdir(parents=True, exist_ok=True)
 fd, temp_path = tempfile.mkstemp(prefix=".config.", dir=config_path.parent)
@@ -128,11 +130,6 @@ import tempfile
 from pathlib import Path
 
 path = Path(sys.argv[1])
-defaults = {
-    "reply_subject": "Re: 您的邮件已收到",
-    "reply_from_name": "系统自动回复",
-    "reply_body": "您好：\n\n您的邮件我们已经收到。我们将尽快评估并与您取得联系。\n\n（这是一封系统自动回复邮件，请勿直接回复）",
-}
 
 try:
     with path.open("r", encoding="utf-8") as handle:
@@ -140,6 +137,17 @@ try:
 except (OSError, json.JSONDecodeError) as exc:
     print(f"配置文件无效：{exc}", file=sys.stderr)
     raise SystemExit(1)
+
+defaults = {
+    "cf_custom_auth": "",
+    "smtp_host": "smtpdm-ap-southeast-1.aliyun.com",
+    "smtp_port": 465,
+    "smtp_encryption": "ssl",
+    "smtp_from_address": str(config.get("smtp_user", "")).strip(),
+    "reply_subject": "Re: 您的邮件已收到",
+    "reply_from_name": "系统自动回复",
+    "reply_body": "您好：\n\n您的邮件我们已经收到。我们将尽快评估并与您取得联系。\n\n（这是一封系统自动回复邮件，请勿直接回复）",
+}
 
 changed = False
 for key, value in defaults.items():
@@ -221,6 +229,30 @@ finally:
 PY
 }
 
+show_connection_config() {
+    python3 - "$CONFIG_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+with Path(sys.argv[1]).open("r", encoding="utf-8") as handle:
+    config = json.load(handle)
+
+def configured(key):
+    return "已设置" if str(config.get(key, "")).strip() else "未设置"
+
+print(f"CF 站点/API 地址：{config.get('cf_api_url', '') or '未设置'}")
+print(f"CF JWT Token：{configured('cf_api_token')}")
+print(f"CF 自定义访问密码：{configured('cf_custom_auth')}（可选）")
+print(f"SMTP 主机：{config.get('smtp_host', '') or '未设置'}")
+print(f"SMTP 端口：{config.get('smtp_port', '') or '未设置'}")
+print(f"SMTP 加密：{config.get('smtp_encryption', '') or '未设置'}")
+print(f"SMTP 用户名：{config.get('smtp_user', '') or '未设置'}")
+print(f"SMTP 密码：{configured('smtp_pass')}")
+print(f"发件人地址：{config.get('smtp_from_address', '') or '未设置'}")
+PY
+}
+
 show_mail_content() {
     python3 - "$CONFIG_FILE" <<'PY'
 import json
@@ -276,15 +308,20 @@ validate_config() {
     python3 - "$CONFIG_FILE" <<'PY'
 import json
 import sys
+from email.utils import parseaddr
 from pathlib import Path
 from urllib.parse import urlparse
 
 path = Path(sys.argv[1])
 required = {
-    "cf_api_url": "CF API URL",
+    "cf_api_url": "CF 站点/API 地址",
     "cf_api_token": "CF JWT Token",
-    "smtp_user": "阿里云发信账号",
-    "smtp_pass": "阿里云 SMTP 密码",
+    "smtp_host": "SMTP 主机",
+    "smtp_port": "SMTP 端口",
+    "smtp_encryption": "SMTP 加密方式",
+    "smtp_user": "SMTP 用户名",
+    "smtp_pass": "SMTP 密码",
+    "smtp_from_address": "发件人地址",
     "reply_subject": "邮件主题",
     "reply_from_name": "发件人名称",
     "reply_body": "邮件正文",
@@ -304,11 +341,37 @@ if missing:
 
 url = urlparse(str(config["cf_api_url"]).strip())
 if url.scheme not in {"http", "https"} or not url.netloc:
-    print("CF API URL 必须是完整的 http:// 或 https:// 地址。", file=sys.stderr)
+    print("CF 站点/API 地址必须是完整的 http:// 或 https:// 地址。", file=sys.stderr)
     raise SystemExit(1)
 
-if "@" not in str(config["smtp_user"]):
-    print("阿里云发信账号格式不正确。", file=sys.stderr)
+api_path = url.path.rstrip("/")
+if api_path and not api_path.endswith(("/api/mails", "/api/messages")):
+    print("CF 地址应为站点根地址或以 /api/mails 结尾。", file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    smtp_port = int(config["smtp_port"])
+except (TypeError, ValueError):
+    print("SMTP 端口必须是数字。", file=sys.stderr)
+    raise SystemExit(1)
+if not 1 <= smtp_port <= 65535:
+    print("SMTP 端口必须在 1-65535 之间。", file=sys.stderr)
+    raise SystemExit(1)
+
+encryption = str(config["smtp_encryption"]).strip().lower()
+if encryption not in {"ssl", "starttls", "none"}:
+    print("SMTP 加密方式只能是 ssl、starttls 或 none。", file=sys.stderr)
+    raise SystemExit(1)
+
+smtp_host = str(config["smtp_host"]).strip()
+if any(char.isspace() for char in smtp_host):
+    print("SMTP 主机不能包含空白字符。", file=sys.stderr)
+    raise SystemExit(1)
+
+from_value = str(config["smtp_from_address"]).strip()
+_, from_address = parseaddr(from_value)
+if not from_address or from_address != from_value or "@" not in from_address:
+    print("发件人地址格式不正确。", file=sys.stderr)
     raise SystemExit(1)
 
 for key, label in (("reply_subject", "邮件主题"), ("reply_from_name", "发件人名称")):
@@ -330,18 +393,21 @@ generate_python_payload() {
 import json
 import os
 import smtplib
+import ssl
 import time
 from email.message import EmailMessage
-from email.utils import formataddr
+from email.utils import formataddr, parseaddr
 from pathlib import Path
+from urllib.parse import parse_qsl, parse_qs, urlencode, urlsplit, urlunsplit
 
 import requests
 
 CONFIG_FILE = Path("/root/cf_auto_reply/config.json")
 RECORD_FILE = Path("/root/cf_auto_reply/replied_ids.txt")
-SMTP_SERVER = "smtpdm-ap-southeast-1.aliyun.com"
-SMTP_PORT = 465
 POLL_INTERVAL = 60
+DEFAULT_SMTP_HOST = "smtpdm-ap-southeast-1.aliyun.com"
+DEFAULT_SMTP_PORT = 465
+DEFAULT_SMTP_ENCRYPTION = "ssl"
 DEFAULT_REPLY_SUBJECT = "Re: 您的邮件已收到"
 DEFAULT_REPLY_FROM_NAME = "系统自动回复"
 DEFAULT_REPLY_BODY = """您好：
@@ -355,14 +421,23 @@ def load_config():
     with CONFIG_FILE.open("r", encoding="utf-8") as handle:
         config = json.load(handle)
 
+    config.setdefault("cf_custom_auth", "")
+    config.setdefault("smtp_host", DEFAULT_SMTP_HOST)
+    config.setdefault("smtp_port", DEFAULT_SMTP_PORT)
+    config.setdefault("smtp_encryption", DEFAULT_SMTP_ENCRYPTION)
+    config.setdefault("smtp_from_address", str(config.get("smtp_user", "")).strip())
     config.setdefault("reply_subject", DEFAULT_REPLY_SUBJECT)
     config.setdefault("reply_from_name", DEFAULT_REPLY_FROM_NAME)
     config.setdefault("reply_body", DEFAULT_REPLY_BODY)
     required = (
         "cf_api_url",
         "cf_api_token",
+        "smtp_host",
+        "smtp_port",
+        "smtp_encryption",
         "smtp_user",
         "smtp_pass",
+        "smtp_from_address",
         "reply_subject",
         "reply_from_name",
         "reply_body",
@@ -370,6 +445,17 @@ def load_config():
     missing = [key for key in required if not str(config.get(key, "")).strip()]
     if missing:
         raise RuntimeError("配置不完整：" + ", ".join(missing))
+
+    try:
+        config["smtp_port"] = int(config["smtp_port"])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("SMTP 端口必须是数字") from exc
+    if not 1 <= config["smtp_port"] <= 65535:
+        raise RuntimeError("SMTP 端口必须在 1-65535 之间")
+
+    config["smtp_encryption"] = str(config["smtp_encryption"]).strip().lower()
+    if config["smtp_encryption"] not in {"ssl", "starttls", "none"}:
+        raise RuntimeError("SMTP 加密方式只能是 ssl、starttls 或 none")
     return config
 
 
@@ -388,14 +474,66 @@ def save_replied_id(message_id):
         os.fsync(handle.fileno())
 
 
+def get_api_token(raw_token):
+    token = str(raw_token).strip()
+    if token.startswith("jwt="):
+        return token[4:]
+    if token.startswith(("http://", "https://")):
+        query_token = parse_qs(urlsplit(token).query).get("jwt", [])
+        if query_token:
+            return query_token[0]
+    return token
+
+
+def build_mails_url(raw_url):
+    parts = urlsplit(str(raw_url).strip())
+    path = parts.path.rstrip("/")
+    if not path:
+        path = "/api/mails"
+    elif path.endswith("/api/messages"):
+        path = path[:-len("/api/messages")] + "/api/mails"
+    elif not path.endswith("/api/mails"):
+        raise ValueError("CF 地址应为站点根地址或以 /api/mails 结尾")
+
+    query = [
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if key not in {"jwt", "limit", "offset"}
+    ]
+    query.extend((("limit", "100"), ("offset", "0")))
+    return urlunsplit((parts.scheme, parts.netloc, path, urlencode(query), ""))
+
+
+def response_preview(response):
+    text = " ".join(response.text.strip().split())
+    return text[:300] or "（空响应）"
+
+
 def get_new_emails(config, replied_ids):
-    headers = {"Authorization": f"Bearer {config['cf_api_token']}"}
-    response = requests.get(config["cf_api_url"], headers=headers, timeout=15)
-    response.raise_for_status()
-    payload = response.json()
-    emails = payload.get("data", [])
+    headers = {"Authorization": f"Bearer {get_api_token(config['cf_api_token'])}"}
+    custom_auth = str(config.get("cf_custom_auth", "")).strip()
+    if custom_auth:
+        headers["x-custom-auth"] = custom_auth
+
+    api_url = build_mails_url(config["cf_api_url"])
+    response = requests.get(api_url, headers=headers, timeout=15)
+    if not response.ok:
+        raise ValueError(
+            f"Cloudflare API 返回 HTTP {response.status_code}：{response_preview(response)}"
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        content_type = response.headers.get("content-type", "未知类型")
+        raise ValueError(
+            f"Cloudflare API 未返回 JSON（{content_type}）：{response_preview(response)}"
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError("Cloudflare API 返回的 JSON 不是对象")
+    emails = payload.get("results", [])
     if not isinstance(emails, list):
-        raise ValueError("API 返回的 data 不是邮件列表")
+        raise ValueError("Cloudflare API 返回的 results 不是邮件列表")
 
     new_emails = []
     seen_ids = set()
@@ -408,6 +546,23 @@ def get_new_emails(config, replied_ids):
         seen_ids.add(message_id)
         new_emails.append(email)
     return new_emails
+
+
+def connect_smtp(config):
+    host = str(config["smtp_host"]).strip()
+    port = config["smtp_port"]
+    encryption = config["smtp_encryption"]
+    tls_context = ssl.create_default_context()
+
+    if encryption == "ssl":
+        return smtplib.SMTP_SSL(host, port, timeout=20, context=tls_context)
+
+    smtp = smtplib.SMTP(host, port, timeout=20)
+    smtp.ehlo()
+    if encryption == "starttls":
+        smtp.starttls(context=tls_context)
+        smtp.ehlo()
+    return smtp
 
 
 def run_auto_responder(config):
@@ -423,22 +578,30 @@ def run_auto_responder(config):
     print(f"发现 {len(new_emails)} 封新邮件，准备回复...", flush=True)
 
     try:
-        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=20) as smtp:
+        with connect_smtp(config) as smtp:
             smtp.login(config["smtp_user"], config["smtp_pass"])
             for email_data in new_emails:
                 message_id = str(email_data["id"])
-                sender_addr = str(email_data.get("source") or "").strip()
-                if not sender_addr or sender_addr.casefold() == config["smtp_user"].casefold():
+                _, sender_addr = parseaddr(str(email_data.get("source") or "").strip())
+                own_addresses = {
+                    str(config["smtp_user"]).strip().casefold(),
+                    str(config["smtp_from_address"]).strip().casefold(),
+                }
+                if not sender_addr or sender_addr.casefold() in own_addresses:
                     continue
 
                 reply = EmailMessage()
                 reply.set_content(config["reply_body"])
                 reply["Subject"] = config["reply_subject"]
-                reply["From"] = formataddr((config["reply_from_name"], config["smtp_user"]))
+                reply["From"] = formataddr((config["reply_from_name"], config["smtp_from_address"]))
                 reply["To"] = sender_addr
 
                 try:
-                    smtp.send_message(reply)
+                    smtp.send_message(
+                        reply,
+                        from_addr=config["smtp_from_address"],
+                        to_addrs=[sender_addr],
+                    )
                     save_replied_id(message_id)
                     print(f"已回复：{sender_addr}", flush=True)
                 except Exception as exc:
@@ -468,38 +631,75 @@ PY
 
 interactive_config() {
     local restart_after="${1:-1}"
-    local input_url input_token input_user input_pass backup changed=0
+    local input_url input_token input_custom_auth input_host input_port
+    local input_encryption input_user input_pass input_from_address backup changed=0
 
     clear 2>/dev/null || true
     echo -e "================================================="
     echo -e " ${CYAN}交互式配置向导${PLAIN}"
     echo -e "================================================="
-    echo -e "${YELLOW}直接按回车键保留当前值。${PLAIN}"
+    echo -e "${YELLOW}除 SMTP 主机、端口和加密方式使用标注的默认值外，其他项目直接按回车保留当前值。${PLAIN}"
+    show_connection_config || return 1
+    echo -e "================================================="
 
     backup="$(mktemp "${INSTALL_DIR}/.config.backup.XXXXXX")" || return 1
     cp -p "$CONFIG_FILE" "$backup"
 
-    IFS= read -r -p "1. 输入 CF API URL（例如 https://mail.example.com/api/messages）: " input_url
+    IFS= read -r -p "1. 输入 CF 站点/API 地址（如 https://mail.example.com 或 .../api/mails）: " input_url
     if [[ -n "$input_url" ]]; then
         write_config_value "cf_api_url" "$input_url" || { mv -f "$backup" "$CONFIG_FILE"; return 1; }
         changed=1
     fi
 
-    IFS= read -r -p "2. 输入 CF JWT Token（链接中 jwt= 后面的内容）: " input_token
+    IFS= read -r -s -p "2. 输入 CF JWT Token（输入内容隐藏；链接中 jwt= 后面的内容）: " input_token
+    echo
     if [[ -n "$input_token" ]]; then
         write_config_value "cf_api_token" "$input_token" || { mv -f "$backup" "$CONFIG_FILE"; return 1; }
         changed=1
     fi
 
-    IFS= read -r -p "3. 输入阿里云发信账号（如 sales@example.com）: " input_user
+    IFS= read -r -s -p "3. 输入 CF 自定义访问密码（可选；输入隐藏；输入 - 可清空）: " input_custom_auth
+    echo
+    if [[ "$input_custom_auth" == "-" ]]; then
+        write_config_value "cf_custom_auth" "" || { mv -f "$backup" "$CONFIG_FILE"; return 1; }
+        changed=1
+    elif [[ -n "$input_custom_auth" ]]; then
+        write_config_value "cf_custom_auth" "$input_custom_auth" || { mv -f "$backup" "$CONFIG_FILE"; return 1; }
+        changed=1
+    fi
+
+    IFS= read -r -p "4. 输入 SMTP 主机 [smtpdm-ap-southeast-1.aliyun.com]: " input_host
+    input_host="${input_host:-smtpdm-ap-southeast-1.aliyun.com}"
+    write_config_value "smtp_host" "$input_host" || { mv -f "$backup" "$CONFIG_FILE"; return 1; }
+    changed=1
+
+    IFS= read -r -p "5. 输入 SMTP 端口 [465]: " input_port
+    input_port="${input_port:-465}"
+    write_config_value "smtp_port" "$input_port" || { mv -f "$backup" "$CONFIG_FILE"; return 1; }
+    changed=1
+
+    IFS= read -r -p "6. 输入 SMTP 加密方式 [ssl]（可选 ssl/starttls/none）: " input_encryption
+    input_encryption="${input_encryption:-ssl}"
+    input_encryption="$(printf '%s' "$input_encryption" | tr '[:upper:]' '[:lower:]')"
+    write_config_value "smtp_encryption" "$input_encryption" || { mv -f "$backup" "$CONFIG_FILE"; return 1; }
+    changed=1
+
+    IFS= read -r -p "7. 输入 SMTP 用户名: " input_user
     if [[ -n "$input_user" ]]; then
         write_config_value "smtp_user" "$input_user" || { mv -f "$backup" "$CONFIG_FILE"; return 1; }
         changed=1
     fi
 
-    IFS= read -r -p "4. 输入阿里云 SMTP 密码（输入内容会显示）: " input_pass
+    IFS= read -r -s -p "8. 输入 SMTP 密码（输入内容隐藏）: " input_pass
+    echo
     if [[ -n "$input_pass" ]]; then
         write_config_value "smtp_pass" "$input_pass" || { mv -f "$backup" "$CONFIG_FILE"; return 1; }
+        changed=1
+    fi
+
+    IFS= read -r -p "9. 输入发件人地址（如 sales@example.com）: " input_from_address
+    if [[ -n "$input_from_address" ]]; then
+        write_config_value "smtp_from_address" "$input_from_address" || { mv -f "$backup" "$CONFIG_FILE"; return 1; }
         changed=1
     fi
 
@@ -706,10 +906,10 @@ show_menu() {
         echo -e "  ${YELLOW}5.${PLAIN} 启动服务"
         echo -e "  ${YELLOW}6.${PLAIN} 查看实时日志"
         echo -e "  ${YELLOW}7.${PLAIN} 修改发送的邮件内容"
-        echo -e "  ${YELLOW}9.${PLAIN} 彻底卸载与清理"
-        echo -e "  ${YELLOW}0.${PLAIN} 退出脚本"
+        echo -e "  ${YELLOW}8.${PLAIN} 彻底卸载与清理"
+        echo -e "  ${YELLOW}9.${PLAIN} 退出脚本"
         echo -e "================================================="
-        IFS= read -r -p "请输入选项 [0-9]: " choice || exit 0
+        IFS= read -r -p "请输入选项 [1-9]: " choice || exit 0
         case "$choice" in
             1)
                 install_and_setup
@@ -745,10 +945,10 @@ show_menu() {
                 configure_mail_content || true
                 pause_menu
                 ;;
-            9)
+            8)
                 uninstall_service
                 ;;
-            0)
+            9)
                 exit 0
                 ;;
             *)
