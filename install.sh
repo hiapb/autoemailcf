@@ -74,6 +74,7 @@ name_map = {
     "CF_API_TOKEN": "cf_api_token",
     "SMTP_USER": "smtp_user",
     "SMTP_PASS": "smtp_pass",
+    "REPLY_BODY": "reply_body",
 }
 placeholders = {
     "URL_PLACEHOLDER",
@@ -81,7 +82,12 @@ placeholders = {
     "USER_PLACEHOLDER",
     "PASS_PLACEHOLDER",
 }
-config = {value: "" for value in name_map.values()}
+config = {
+    "cf_api_url": "",
+    "cf_api_token": "",
+    "smtp_user": "",
+    "smtp_pass": "",
+}
 
 try:
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
@@ -113,6 +119,48 @@ finally:
 PY
 }
 
+ensure_config_defaults() {
+    python3 - "$CONFIG_FILE" <<'PY'
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+path = Path(sys.argv[1])
+defaults = {
+    "reply_subject": "Re: 您的邮件已收到",
+    "reply_from_name": "系统自动回复",
+    "reply_body": "您好：\n\n您的邮件我们已经收到。我们将尽快评估并与您取得联系。\n\n（这是一封系统自动回复邮件，请勿直接回复）",
+}
+
+try:
+    with path.open("r", encoding="utf-8") as handle:
+        config = json.load(handle)
+except (OSError, json.JSONDecodeError) as exc:
+    print(f"配置文件无效：{exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+changed = False
+for key, value in defaults.items():
+    if key not in config:
+        config[key] = value
+        changed = True
+
+if changed:
+    fd, temp_path = tempfile.mkstemp(prefix=".config.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(config, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+PY
+}
+
 prepare_config() {
     install -d -m 700 "$INSTALL_DIR"
     migrate_legacy_config || return 1
@@ -138,6 +186,7 @@ with os.fdopen(fd, "w", encoding="utf-8") as handle:
 PY
     fi
 
+    ensure_config_defaults || return 1
     chmod 600 "$CONFIG_FILE"
 }
 
@@ -172,6 +221,57 @@ finally:
 PY
 }
 
+show_mail_content() {
+    python3 - "$CONFIG_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+with Path(sys.argv[1]).open("r", encoding="utf-8") as handle:
+    config = json.load(handle)
+
+print(f"当前邮件主题：{config.get('reply_subject', '')}")
+print(f"当前发件人名称：{config.get('reply_from_name', '')}")
+print("当前邮件正文：")
+print("-----------------------------------------------")
+print(config.get("reply_body", ""))
+print("-----------------------------------------------")
+PY
+}
+
+validate_mail_content() {
+    python3 - "$CONFIG_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+required = {
+    "reply_subject": "邮件主题",
+    "reply_from_name": "发件人名称",
+    "reply_body": "邮件正文",
+}
+
+try:
+    with path.open("r", encoding="utf-8") as handle:
+        config = json.load(handle)
+except (OSError, json.JSONDecodeError) as exc:
+    print(f"配置文件无效：{exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+missing = [label for key, label in required.items() if not str(config.get(key, "")).strip()]
+if missing:
+    print("以下邮件内容不能为空：" + "、".join(missing), file=sys.stderr)
+    raise SystemExit(1)
+
+for key, label in (("reply_subject", "邮件主题"), ("reply_from_name", "发件人名称")):
+    value = str(config[key])
+    if "\r" in value or "\n" in value:
+        print(f"{label}不能包含换行符。", file=sys.stderr)
+        raise SystemExit(1)
+PY
+}
+
 validate_config() {
     python3 - "$CONFIG_FILE" <<'PY'
 import json
@@ -185,6 +285,9 @@ required = {
     "cf_api_token": "CF JWT Token",
     "smtp_user": "阿里云发信账号",
     "smtp_pass": "阿里云 SMTP 密码",
+    "reply_subject": "邮件主题",
+    "reply_from_name": "发件人名称",
+    "reply_body": "邮件正文",
 }
 
 try:
@@ -207,6 +310,12 @@ if url.scheme not in {"http", "https"} or not url.netloc:
 if "@" not in str(config["smtp_user"]):
     print("阿里云发信账号格式不正确。", file=sys.stderr)
     raise SystemExit(1)
+
+for key, label in (("reply_subject", "邮件主题"), ("reply_from_name", "发件人名称")):
+    value = str(config[key])
+    if "\r" in value or "\n" in value:
+        print(f"{label}不能包含换行符。", file=sys.stderr)
+        raise SystemExit(1)
 PY
 }
 
@@ -223,6 +332,7 @@ import os
 import smtplib
 import time
 from email.message import EmailMessage
+from email.utils import formataddr
 from pathlib import Path
 
 import requests
@@ -232,7 +342,9 @@ RECORD_FILE = Path("/root/cf_auto_reply/replied_ids.txt")
 SMTP_SERVER = "smtpdm-ap-southeast-1.aliyun.com"
 SMTP_PORT = 465
 POLL_INTERVAL = 60
-REPLY_BODY = """您好：
+DEFAULT_REPLY_SUBJECT = "Re: 您的邮件已收到"
+DEFAULT_REPLY_FROM_NAME = "系统自动回复"
+DEFAULT_REPLY_BODY = """您好：
 
 您的邮件我们已经收到。我们将尽快评估并与您取得联系。
 
@@ -243,7 +355,18 @@ def load_config():
     with CONFIG_FILE.open("r", encoding="utf-8") as handle:
         config = json.load(handle)
 
-    required = ("cf_api_url", "cf_api_token", "smtp_user", "smtp_pass")
+    config.setdefault("reply_subject", DEFAULT_REPLY_SUBJECT)
+    config.setdefault("reply_from_name", DEFAULT_REPLY_FROM_NAME)
+    config.setdefault("reply_body", DEFAULT_REPLY_BODY)
+    required = (
+        "cf_api_url",
+        "cf_api_token",
+        "smtp_user",
+        "smtp_pass",
+        "reply_subject",
+        "reply_from_name",
+        "reply_body",
+    )
     missing = [key for key in required if not str(config.get(key, "")).strip()]
     if missing:
         raise RuntimeError("配置不完整：" + ", ".join(missing))
@@ -309,9 +432,9 @@ def run_auto_responder(config):
                     continue
 
                 reply = EmailMessage()
-                reply.set_content(REPLY_BODY)
-                reply["Subject"] = "Re: 您的邮件已收到"
-                reply["From"] = f"系统自动回复 <{config['smtp_user']}>"
+                reply.set_content(config["reply_body"])
+                reply["Subject"] = config["reply_subject"]
+                reply["From"] = formataddr((config["reply_from_name"], config["smtp_user"]))
                 reply["To"] = sender_addr
 
                 try:
@@ -396,6 +519,80 @@ interactive_config() {
     if [[ "$restart_after" == "1" ]]; then
         restart_service
     fi
+}
+
+configure_mail_content() {
+    local input_subject input_from_name line input_body backup changed=0
+    local -a body_lines=()
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo -e "${RED}未找到 Python 3，请先选择“一键安装”。${PLAIN}"
+        return 1
+    fi
+
+    prepare_config || return 1
+
+    clear 2>/dev/null || true
+    echo -e "================================================="
+    echo -e " ${CYAN}修改发送的邮件内容${PLAIN}"
+    echo -e "================================================="
+    show_mail_content || return 1
+    echo -e "${YELLOW}主题和发件人名称直接按回车可保留当前值。${PLAIN}"
+
+    backup="$(mktemp "${INSTALL_DIR}/.config.backup.XXXXXX")" || return 1
+    cp -p "$CONFIG_FILE" "$backup"
+
+    IFS= read -r -p "1. 输入新邮件主题: " input_subject
+    if [[ -n "$input_subject" ]]; then
+        write_config_value "reply_subject" "$input_subject" || { mv -f "$backup" "$CONFIG_FILE"; return 1; }
+        changed=1
+    fi
+
+    IFS= read -r -p "2. 输入新发件人名称: " input_from_name
+    if [[ -n "$input_from_name" ]]; then
+        write_config_value "reply_from_name" "$input_from_name" || { mv -f "$backup" "$CONFIG_FILE"; return 1; }
+        changed=1
+    fi
+
+    echo "3. 输入新邮件正文（支持多行，单独一行输入 . 后结束）:"
+    echo -e "${YELLOW}   如果不修改正文，请直接输入 .${PLAIN}"
+    while true; do
+        if ! IFS= read -r line; then
+            mv -f "$backup" "$CONFIG_FILE"
+            echo -e "${RED}输入已中断，配置未保存。${PLAIN}"
+            return 1
+        fi
+        [[ "$line" == "." ]] && break
+        body_lines+=("$line")
+    done
+
+    if ((${#body_lines[@]} > 0)); then
+        input_body="$(printf '%s\n' "${body_lines[@]}")"
+        write_config_value "reply_body" "$input_body" || { mv -f "$backup" "$CONFIG_FILE"; return 1; }
+        changed=1
+    fi
+
+    if ! validate_mail_content; then
+        mv -f "$backup" "$CONFIG_FILE"
+        echo -e "${RED}邮件内容未保存，已恢复修改前的内容。${PLAIN}"
+        return 1
+    fi
+
+    if ((changed == 0)); then
+        rm -f "$backup"
+        echo -e "${YELLOW}没有输入新内容，配置保持不变。${PLAIN}"
+        return 0
+    fi
+
+    if ! generate_python_payload; then
+        mv -f "$backup" "$CONFIG_FILE"
+        echo -e "${RED}更新后台程序失败，已恢复修改前的邮件内容。${PLAIN}"
+        return 1
+    fi
+
+    rm -f "$backup"
+    echo -e "${GREEN}邮件内容已保存。${PLAIN}"
+    restart_service
 }
 
 write_service_file() {
@@ -508,6 +705,7 @@ show_menu() {
         echo -e "  ${YELLOW}4.${PLAIN} 停止服务"
         echo -e "  ${YELLOW}5.${PLAIN} 启动服务"
         echo -e "  ${YELLOW}6.${PLAIN} 查看实时日志"
+        echo -e "  ${YELLOW}7.${PLAIN} 修改发送的邮件内容"
         echo -e "  ${YELLOW}9.${PLAIN} 彻底卸载与清理"
         echo -e "  ${YELLOW}0.${PLAIN} 退出脚本"
         echo -e "================================================="
@@ -542,6 +740,10 @@ show_menu() {
                 ;;
             6)
                 journalctl -u "$SERVICE_NAME" -f
+                ;;
+            7)
+                configure_mail_content || true
+                pause_menu
                 ;;
             9)
                 uninstall_service
